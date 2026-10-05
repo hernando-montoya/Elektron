@@ -105,69 +105,45 @@ object ProjectSerializer {
 
             val elements = mutableListOf<GraphicElement>()
 
-            // Dividir bloques de elementos por "kind"
-            val kindBlocks = json.split("{\"kind\"")
-            for (i in 1 until kindBlocks.size) {
-                val block = "{\"kind\"" + kindBlocks[i].substringBefore("}") + "}"
-                val kind = extractString(block, "\"kind\"")
-                val id = extractString(block, "\"id\"") ?: "elem-$i"
+            // Extraer cada objeto de elemento dentro de "elements": [ ... ]
+            val elementsKeyIdx = json.indexOf("\"elements\"")
+            if (elementsKeyIdx != -1) {
+                val arrayStart = json.indexOf('[', elementsKeyIdx)
+                if (arrayStart != -1) {
+                    var depth = 0
+                    var currentStart = -1
+                    var inQuotes = false
+                    var isEscaped = false
 
-                when (kind) {
-                    "WIRE" -> {
-                        val points = extractPointsList(kindBlocks[i])
-                        if (points.size >= 2) {
-                            elements.add(
-                                WireElement(
-                                    id = id,
-                                    points = points
-                                )
-                            )
+                    for (i in arrayStart until json.length) {
+                        val c = json[i]
+                        if (isEscaped) {
+                            isEscaped = false
+                            continue
                         }
-                    }
-                    "BOX" -> {
-                        val tl = extractPoint(block, "\"topLeft\"") ?: Offset.Zero
-                        val br = extractPoint(block, "\"bottomRight\"") ?: Offset(100f, 100f)
-                        elements.add(
-                            BoxElement(
-                                id = id,
-                                topLeft = tl,
-                                bottomRight = br
-                            )
-                        )
-                    }
-                    "SYMBOL" -> {
-                        val typeStr = extractString(block, "\"type\"") ?: SymbolType.CIRCUIT_BREAKER.name
-                        val type = runCatching { SymbolType.valueOf(typeStr) }.getOrDefault(SymbolType.CIRCUIT_BREAKER)
-                        val pos = extractPoint(block, "\"position\"") ?: Offset.Zero
-                        val rot = extractInt(block, "\"rotation\"") ?: 0
-                        val label = extractString(block, "\"label\"") ?: type.defaultLabel
-                        val des = extractString(block, "\"designation\"") ?: type.standardRating
+                        if (c == '\\') {
+                            isEscaped = true
+                            continue
+                        }
+                        if (c == '"') {
+                            inQuotes = !inQuotes
+                            continue
+                        }
+                        if (inQuotes) continue
 
-                        elements.add(
-                            SymbolElement(
-                                id = id,
-                                type = type,
-                                position = pos,
-                                rotationDegrees = rot,
-                                label = label,
-                                designation = des
-                            )
-                        )
-                    }
-                    "TEXT" -> {
-                        val text = extractString(block, "\"text\"") ?: "Texte"
-                        val pos = extractPoint(block, "\"position\"") ?: Offset.Zero
-                        val fontSize = extractFloat(block, "\"fontSize\"") ?: 13f
-                        val isBold = block.contains("\"isBold\": true") || block.contains("\"isBold\":true")
-                        elements.add(
-                            TextElement(
-                                id = id,
-                                text = text,
-                                position = pos,
-                                fontSize = fontSize,
-                                isBold = isBold
-                            )
-                        )
+                        if (c == '{') {
+                            if (depth == 0) currentStart = i
+                            depth++
+                        } else if (c == '}') {
+                            depth--
+                            if (depth == 0 && currentStart != -1) {
+                                val block = json.substring(currentStart, i + 1)
+                                parseElementBlock(block)?.let { elements.add(it) }
+                                currentStart = -1
+                            }
+                        } else if (c == ']' && depth == 0) {
+                            break
+                        }
                     }
                 }
             }
@@ -182,6 +158,55 @@ object ProjectSerializer {
             )
         } catch (e: Exception) {
             return null
+        }
+    }
+
+    private fun parseElementBlock(block: String): GraphicElement? {
+        val kind = extractString(block, "\"kind\"") ?: return null
+        val id = extractString(block, "\"id\"") ?: "elem-${block.hashCode()}"
+
+        return when (kind) {
+            "WIRE" -> {
+                val points = extractPointsList(block)
+                if (points.size >= 2) {
+                    WireElement(id = id, points = points)
+                } else null
+            }
+            "BOX" -> {
+                val tl = extractPoint(block, "\"topLeft\"") ?: Offset.Zero
+                val br = extractPoint(block, "\"bottomRight\"") ?: Offset(100f, 100f)
+                BoxElement(id = id, topLeft = tl, bottomRight = br)
+            }
+            "SYMBOL" -> {
+                val typeStr = extractString(block, "\"type\"") ?: SymbolType.CIRCUIT_BREAKER.name
+                val type = runCatching { SymbolType.valueOf(typeStr) }.getOrDefault(SymbolType.CIRCUIT_BREAKER)
+                val pos = extractPoint(block, "\"position\"") ?: Offset.Zero
+                val rot = extractInt(block, "\"rotation\"") ?: 0
+                val label = extractString(block, "\"label\"") ?: type.defaultLabel
+                val des = extractString(block, "\"designation\"") ?: type.standardRating
+                SymbolElement(
+                    id = id,
+                    type = type,
+                    position = pos,
+                    rotationDegrees = rot,
+                    label = label,
+                    designation = des
+                )
+            }
+            "TEXT" -> {
+                val text = extractString(block, "\"text\"") ?: "Texte"
+                val pos = extractPoint(block, "\"position\"") ?: Offset.Zero
+                val fontSize = extractFloat(block, "\"fontSize\"") ?: 13f
+                val isBold = block.contains("\"isBold\": true") || block.contains("\"isBold\":true")
+                TextElement(
+                    id = id,
+                    text = text,
+                    position = pos,
+                    fontSize = fontSize,
+                    isBold = isBold
+                )
+            }
+            else -> null
         }
     }
 
@@ -236,17 +261,25 @@ object ProjectSerializer {
 
     private fun extractPointsList(rawBlock: String): List<Offset> {
         val points = mutableListOf<Offset>()
-        val startIdx = rawBlock.indexOf("\"points\": [")
+        val startIdx = rawBlock.indexOf("\"points\"")
         if (startIdx == -1) return emptyList()
-        val endIdx = rawBlock.indexOf(']', startIdx + 11)
-        // Buscar pares [x, y]
-        var searchPos = startIdx + 10
-        while (searchPos < rawBlock.length && searchPos < endIdx + 200) {
-            val ob = rawBlock.indexOf('[', searchPos)
-            if (ob == -1 || ob > endIdx) break
-            val cb = rawBlock.indexOf(']', ob)
-            if (cb == -1) break
-            val parts = rawBlock.substring(ob + 1, cb).split(',')
+        val colon = rawBlock.indexOf(':', startIdx)
+        if (colon == -1) return emptyList()
+        val arrayStart = rawBlock.indexOf('[', colon)
+        if (arrayStart == -1) return emptyList()
+
+        var pos = arrayStart + 1
+        while (pos < rawBlock.length) {
+            val nextOpen = rawBlock.indexOf('[', pos)
+            val outerClose = rawBlock.indexOf(']', pos)
+            if (nextOpen == -1 || (outerClose != -1 && outerClose < nextOpen)) {
+                break
+            }
+            val nextClose = rawBlock.indexOf(']', nextOpen)
+            if (nextClose == -1) break
+
+            val pairStr = rawBlock.substring(nextOpen + 1, nextClose)
+            val parts = pairStr.split(',')
             if (parts.size == 2) {
                 val x = parts[0].trim().toFloatOrNull()
                 val y = parts[1].trim().toFloatOrNull()
@@ -254,7 +287,7 @@ object ProjectSerializer {
                     points.add(Offset(x, y))
                 }
             }
-            searchPos = cb + 1
+            pos = nextClose + 1
         }
         return points
     }
